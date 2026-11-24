@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <!-- Primary policy (as specified): nothing loads except this folder's own script, styles and data: images. -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'none'; img-src 'self' data:; base-uri 'none'; form-action 'none';">
+  <!-- Additive policy: Trusted Types lock every DOM-XSS sink (innerHTML, eval, script URLs, …) shut. -->
+  <meta http-equiv="Content-Security-Policy" content="require-trusted-types-for 'script'; trusted-types 'none';">
+  <meta name="referrer" content="no-referrer">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#07060f">
+  <meta name="description" content="Pixel Dash — an offline retro auto-runner platformer.">
+  <title>Pixel Dash — Retro Auto-Runner</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="style.css">
+  <script src="game.js" defer></script>
+</head>
+<body>
+  <main id="app">
+    <div id="stage">
+      <canvas id="game" width="426" height="240" aria-label="Pixel Dash game screen"></canvas>
+      <div id="crt" class="crt" aria-hidden="true"></div>
+
+      <!-- ===== HUD ===== -->
+      <header id="hud" class="hud hidden">
+        <div class="hud-group glass">
+          <div class="stat"><span class="lbl">Score</span><span id="hud-score" class="val">000000</span></div>
+          <div class="stat"><span class="lbl">Coins</span><span id="hud-coins" class="val">×00</span></div>
+          <div class="stat"><span class="lbl">Stage</span><span id="hud-stage" class="val">1</span></div>
+          <div class="stat"><span class="lbl">Lives</span><span id="hud-lives" class="val">♥3</span></div>
+          <div class="stat opt"><span class="lbl">Best</span><span id="hud-best" class="val">000000</span></div>
+        </div>
+        <div class="hud-actions">
+          <button id="hud-full" class="icon-btn glass" type="button" aria-label="Fullscreen (F)" aria-pressed="false" title="Fullscreen (F)">⛶</button>
+          <button id="hud-mute" class="icon-btn glass" type="button" aria-label="Mute (M)" aria-pressed="false" title="Mute (M)">♪</button>
+          <button id="hud-pause" class="icon-btn glass" type="button" aria-label="Pause (P)" title="Pause (P / Esc)">❚❚</button>
+        </div>
+      </header>
+
+      <div id="banner" class="banner glass" aria-live="polite">
+        <span id="banner-sub">STAGE 1</span>
+        <strong id="banner-title">Grasslands</strong>
+      </div>
+
+      <!-- ===== START SCREEN ===== -->
+      <section id="menu" class="overlay show" aria-label="Start screen">
+        <div class="panel glass wide">
+          <canvas id="preview" width="96" height="32" aria-hidden="true"></canvas>
+          <h1 class="title">PIXEL<span>DASH</span></h1>
+          <p class="tagline">Run. Vault. Wall-kick. Never stop.</p>
+          <div class="modes" id="modes" role="radiogroup" aria-label="Choose a stage or mode">
+            <button type="button" class="mode selected" data-mode="0" role="radio" aria-checked="true">
+              <canvas class="thumb" width="128" height="72" aria-hidden="true"></canvas>
+              <span class="num">1</span><span class="name">Grasslands</span>
+            </button>
+            <button type="button" class="mode" data-mode="1" role="radio" aria-checked="false">
+              <canvas class="thumb" width="128" height="72" aria-hidden="true"></canvas>
+              <span class="num">2</span><span class="name">Crystal Cavern</span>
+            </button>
+            <button type="button" class="mode" data-mode="2" role="radio" aria-checked="false">
+              <canvas class="thumb" width="128" height="72" aria-hidden="true"></canvas>
+              <span class="num">3</span><span class="name">Ember Fortress</span>
+            </button>
+            <button type="button" class="mode" data-mode="endless" role="radio" aria-checked="false">
+              <canvas class="thumb" width="128" height="72" aria-hidden="true"></canvas>
+              <span class="num">∞</span><span class="name">Endless</span>
+            </button>
+          </div>
+          <button id="btn-start" type="button" class="btn primary">Start Run ▸</button>
+          <div class="row-toggles">
+            <button id="btn-music" type="button" class="chip">Music: On</button>
+            <button id="btn-sound" type="button" class="chip">Sound: On</button>
+            <button id="btn-crt" type="button" class="chip">CRT: Off</button>
+          </div>
+          <p class="touch-hint">Tap anywhere to jump · hold to soar · tap again in mid-air to spin</p>
+          <dl class="controls">
+            <dt>Space · W · ↑ · Click</dt><dd>Jump — tap to hop, hold to soar</dd>
+            <dt>Jump in mid-air</dt><dd>Spin — a short floating boost</dd>
+            <dt>Jump on a wall</dt><dd>Wall-kick off the other way</dd>
+            <dt>Jump while vaulting</dt><dd>High vault</dd>
+            <dt>Gamepad</dt><dd>A / B jump · Start pause · D-pad picks a stage</dd>
+            <dt>P/Esc · M · N · C · F</dt><dd>Pause · Mute · Music · CRT filter · Fullscreen</dd>
+          </dl>
+          <p class="records">High Score <b id="menu-high">0</b> · Endless Best <b id="menu-endless">0 m</b></p>
+        </div>
+      </section>
+
+      <!-- ===== PAUSE ===== -->
+      <section id="pause" class="overlay" aria-label="Paused" inert>
+        <div class="panel glass narrow">
+          <h2 class="heading">Paused</h2>
+          <div class="btn-col">
+            <button id="btn-resume" type="button" class="btn primary">Resume ▸</button>
+            <button id="btn-restart" type="button" class="btn ghost">Restart Stage</button>
+            <button id="btn-quit" type="button" class="btn ghost">Main Menu</button>
+          </div>
+          <div class="row-toggles">
+            <button id="btn-music-p" type="button" class="chip">Music: On</button>
+            <button id="btn-sound-p" type="button" class="chip">Sound: On</button>
+            <button id="btn-crt-p" type="button" class="chip">CRT: Off</button>
+          </div>
+          <p class="hint">Press P or Esc to resume</p>
+        </div>
+      </section>
+
+      <!-- ===== STAGE CLEAR ===== -->
+      <section id="clear" class="overlay" aria-label="Stage clear" inert>
+        <div class="panel glass narrow">
+          <p class="kicker" id="clear-kicker">STAGE 1</p>
+          <h2 class="heading" id="clear-title">Stage Clear!</h2>
+          <ul class="tally" id="tally"></ul>
+          <div class="btn-col">
+            <button id="btn-next" type="button" class="btn primary">Next Stage ▸</button>
+            <button id="btn-clear-menu" type="button" class="btn ghost">Main Menu</button>
+          </div>
+          <p class="hint">Press Enter to continue</p>
+        </div>
+      </section>
+
+      <!-- ===== GAME OVER ===== -->
+      <section id="over" class="overlay" aria-label="Game over" inert>
+        <div class="panel glass narrow">
+          <h2 class="heading danger">Game Over</h2>
+          <p class="kicker" id="over-detail">Stage 1 · Grasslands</p>
+          <div class="big-score" id="over-score">000000</div>
+          <span class="badge" id="over-badge">NEW HIGH SCORE</span>
+          <p class="records">Best <b id="over-best">0</b></p>
+          <div class="btn-col">
+            <button id="btn-retry" type="button" class="btn primary">Try Again ▸</button>
+            <button id="btn-over-menu" type="button" class="btn ghost">Main Menu</button>
+          </div>
+          <p class="hint">Press Enter to retry · Esc for menu</p>
+        </div>
+      </section>
+    </div>
+  </main>
+</body>
+</html>
