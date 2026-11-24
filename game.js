@@ -115,9 +115,19 @@
   // ===================================================================
   //  PIXEL ART — matrices baked to offscreen canvases at startup
   // ===================================================================
-  /** Sprite surfaces live off-DOM (OffscreenCanvas when available). */
+  /** Feature-test OffscreenCanvas 2D (iOS Safari 16.4-16.7 exposed OffscreenCanvas without 2D context). */
+  const CAN_OFFSCREEN_2D = (() => {
+    if (typeof OffscreenCanvas !== 'function') return false;
+    try {
+      return !!new OffscreenCanvas(1, 1).getContext('2d');
+    } catch {
+      return false;
+    }
+  })();
+
+  /** Sprite surfaces live off-DOM (OffscreenCanvas when 2D is supported). */
   function makeCanvas(w, h) {
-    if (typeof OffscreenCanvas === 'function') return new OffscreenCanvas(w, h);
+    if (CAN_OFFSCREEN_2D) return new OffscreenCanvas(w, h);
     const c = document.createElement('canvas');
     c.width = w;
     c.height = h;
@@ -1074,18 +1084,23 @@
 
   const Sound = {
     ctx: null, master: null, sfxBus: null, musicBus: null, noiseBuf: null,
-    sfxOn: prefs.sound, musicOn: prefs.music, muted: false,
+    sfxOn: prefs.sound, musicOn: prefs.music, muted: false, primed: false,
     track: null, trackName: '', step: 0, nextTime: 0, speed: 1, playing: false, paused: false,
     silent: false, // set while the title-screen demo simulates, so it never makes noise
 
     unlock() {
       if (!this.ctx) {
-        if (typeof AudioContext !== 'function') return;
+        const AudioCtx = window.AudioContext || window.webkitAudioContext;
+        if (typeof AudioCtx !== 'function') return;
         try {
-          this.ctx = new AudioContext({ latencyHint: 'interactive' });
+          this.ctx = new AudioCtx({ latencyHint: 'interactive' });
         } catch {
-          this.ctx = null;
-          return;
+          try {
+            this.ctx = new AudioCtx();
+          } catch {
+            this.ctx = null;
+            return;
+          }
         }
         const c = this.ctx;
         this.master = c.createGain();
@@ -1102,17 +1117,37 @@
         const d = this.noiseBuf.getChannelData(0);
         for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
       }
-      if (this.ctx.state === 'suspended') this.ctx.resume().catch(() => { /* needs a user gesture */ });
+      // Handle both standard 'suspended' and iOS Safari 'interrupted' states
+      if (this.ctx.state !== 'running') {
+        this.ctx.resume().then(() => { this.nextTime = 0; }).catch(() => { /* needs a user gesture */ });
+      }
+      // Prime iOS WebKit audio hardware once on the first user gesture
+      if (!this.primed && this.ctx && this.master) {
+        this.primed = true;
+        try {
+          const b = this.ctx.createBuffer(1, 1, this.ctx.sampleRate);
+          const s = this.ctx.createBufferSource();
+          s.buffer = b;
+          s.connect(this.master);
+          s.start(0);
+          s.addEventListener('ended', () => { s.disconnect(); }, { once: true });
+        } catch {
+          /* ignore */
+        }
+      }
     },
     /** Release the audio thread while the tab is hidden. */
     sleep() {
+      this.nextTime = 0;
       if (this.ctx && this.ctx.state === 'running') this.ctx.suspend().catch(() => { /* ignore */ });
     },
     ok() { return !!this.ctx && this.ctx.state === 'running'; },
     ramp(param, v) {
       if (!this.ctx) return;
-      param.cancelScheduledValues(this.ctx.currentTime);
-      param.setTargetAtTime(v, this.ctx.currentTime, 0.03);
+      const t = this.ctx.currentTime;
+      param.cancelScheduledValues(t);
+      param.setValueAtTime(param.value, t);
+      param.setTargetAtTime(v, t, 0.03);
     },
     setMuted(m) { this.muted = m; if (this.master) this.ramp(this.master.gain, m ? 0 : 0.8); },
     setSfx(on) { this.sfxOn = on; if (this.sfxBus) this.ramp(this.sfxBus.gain, on ? 0.55 : 0); },
@@ -1120,36 +1155,42 @@
 
     toneAt(when, type, f0, f1, dur, vol, bus) {
       const c = this.ctx;
+      const t0 = Math.max(c.currentTime, when);
+      const d = Math.max(0.01, dur);
+      const atk = Math.min(0.006, d * 0.4);
       const o = c.createOscillator();
       const g = c.createGain();
       o.type = type;
-      o.frequency.setValueAtTime(f0, when);
-      if (f1 && f1 !== f0) o.frequency.exponentialRampToValueAtTime(Math.max(20, f1), when + dur);
-      g.gain.setValueAtTime(0.0001, when);
-      g.gain.exponentialRampToValueAtTime(Math.max(0.0002, vol), when + 0.006);
-      g.gain.exponentialRampToValueAtTime(0.0001, when + dur);
+      o.frequency.setValueAtTime(Math.max(20, f0), t0);
+      if (f1 && f1 !== f0) o.frequency.exponentialRampToValueAtTime(Math.max(20, f1), t0 + d);
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.exponentialRampToValueAtTime(Math.max(0.0002, vol), t0 + atk);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + d);
       o.connect(g);
       g.connect(bus || this.sfxBus);
-      o.start(when);
-      o.stop(when + dur + 0.03);
+      o.start(t0);
+      o.stop(t0 + d + 0.03);
       o.addEventListener('ended', () => { o.disconnect(); g.disconnect(); }, { once: true });
     },
     noiseAt(when, dur, vol, freq, bus, type = 'bandpass') {
       const c = this.ctx;
+      const t0 = Math.max(c.currentTime, when);
+      const d = Math.max(0.01, dur);
       const s = c.createBufferSource();
       s.buffer = this.noiseBuf;
+      s.loop = true;
       const f = c.createBiquadFilter();
       f.type = type;
       f.frequency.value = freq;
       f.Q.value = 0.8;
       const g = c.createGain();
-      g.gain.setValueAtTime(vol, when);
-      g.gain.exponentialRampToValueAtTime(0.0001, when + dur);
+      g.gain.setValueAtTime(Math.max(0.0002, vol), t0);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + d);
       s.connect(f);
       f.connect(g);
       g.connect(bus || this.sfxBus);
-      s.start(when, Math.random() * 0.5);
-      s.stop(when + dur + 0.02);
+      s.start(t0, Math.random() * 0.5);
+      s.stop(t0 + d + 0.02);
       s.addEventListener('ended', () => { s.disconnect(); f.disconnect(); g.disconnect(); }, { once: true });
     },
     tone(type, f0, f1, dur, vol, delay = 0) {
@@ -1651,25 +1692,103 @@
   }
 
   // ===================================================================
-  //  DOM / CANVAS SETUP
+  //  DOM / CANVAS / ADAPTIVE DEVICE PROFILE
   // ===================================================================
   const $ = id => document.getElementById(id);
+  const rootEl = document.documentElement;
+  const appEl = $('app');
+  const stageWrapEl = $('stage-wrap');
+  const stageEl = $('stage');
   const canvas = $('game');
   const ctx = canvas.getContext('2d', { alpha: false });
-  const stageEl = $('stage');
   const previewCanvas = $('preview');
   const pctx = previewCanvas ? previewCanvas.getContext('2d') : null;
+  const touchUiEl = $('touch-ui');
+  const jumpBtnEl = $('btn-jump');
+  const jumpLblEl = $('jump-lbl');
   let viewW = 426;
+  let inputOverride = null; // null (auto) | 'touch' | 'desktop' (dynamic for hybrid devices)
+  let resizeTimer = 0;
+  let lastJumpCue = 'JUMP';
+
+  const matchQuery = q => typeof window.matchMedia === 'function' && window.matchMedia(q).matches;
+
+  function getViewportSize() {
+    const vv = window.visualViewport;
+    if (vv && vv.width > 0 && vv.height > 0) return { w: vv.width, h: vv.height };
+    return { w: Math.max(1, window.innerWidth), h: Math.max(1, window.innerHeight) };
+  }
+
+  function detectDeviceProfile(ww, wh) {
+    const coarse = matchQuery('(pointer: coarse)');
+    const anyCoarse = matchQuery('(any-pointer: coarse)');
+    const fine = matchQuery('(pointer: fine)');
+    const hover = matchQuery('(hover: hover)');
+    const maxTouch = navigator.maxTouchPoints || 0;
+    const ua = navigator.userAgent || '';
+    const isIOS = /iPhone|iPad|iPod/i.test(ua) || (navigator.platform === 'MacIntel' && maxTouch > 1);
+    const isAndroid = /Android/i.test(ua);
+    const isMobileUA = isIOS || isAndroid || /Mobile|Silk|Kindle|PlayBook/i.test(ua);
+
+    const shortSide = Math.min(ww, wh);
+    const longSide = Math.max(ww, wh);
+    const touchPrimary = coarse || isMobileUA || (maxTouch > 0 && !hover && !fine);
+
+    let device = 'desktop';
+    if (touchPrimary) {
+      device = (shortSide <= 560 && longSide <= 1024) ? 'phone' : 'tablet';
+    } else if (anyCoarse && shortSide <= 560) {
+      device = 'phone';
+    }
+
+    const inputMode = inputOverride || (touchPrimary ? 'touch' : 'desktop');
+    const orientation = wh > ww ? 'portrait' : 'landscape';
+    return { device, input: inputMode, orientation };
+  }
+
+  function applyDeviceProfile(ww, wh) {
+    const prof = detectDeviceProfile(ww, wh);
+    if (rootEl.dataset.device !== prof.device) rootEl.dataset.device = prof.device;
+    if (rootEl.dataset.input !== prof.input) rootEl.dataset.input = prof.input;
+    if (rootEl.dataset.orientation !== prof.orientation) rootEl.dataset.orientation = prof.orientation;
+    return prof;
+  }
 
   function resize() {
-    const ww = Math.max(1, window.innerWidth), wh = Math.max(1, window.innerHeight);
-    viewW = Math.round(clamp(VIEW_H * (ww / wh), 256, 576));
-    canvas.width = viewW;
-    canvas.height = VIEW_H;
-    const scale = Math.min(ww / viewW, wh / VIEW_H);
-    stageEl.style.width = Math.floor(viewW * scale) + 'px';
-    stageEl.style.height = Math.floor(VIEW_H * scale) + 'px';
+    const vp = getViewportSize();
+    applyDeviceProfile(vp.w, vp.h);
+
+    // Measure stage-wrap after layout attributes apply so portrait 3-zone mode never overlaps HUD or touch deck
+    const rect = stageWrapEl ? stageWrapEl.getBoundingClientRect() : null;
+    const aw = rect && rect.width > 16 ? rect.width : vp.w;
+    const ah = rect && rect.height > 16 ? rect.height : vp.h;
+
+    viewW = Math.round(clamp(VIEW_H * (aw / ah), 256, 576));
+    if (canvas.width !== viewW) canvas.width = viewW;
+    if (canvas.height !== VIEW_H) canvas.height = VIEW_H;
+    const scale = Math.min(aw / viewW, ah / VIEW_H);
+    stageEl.style.width = Math.max(1, Math.floor(viewW * scale)) + 'px';
+    stageEl.style.height = Math.max(1, Math.floor(VIEW_H * scale)) + 'px';
     ctx.imageSmoothingEnabled = false;
+
+    // Keep camera cleanly bounded if the device rotated mid-run or while paused
+    if (level && player) {
+      camLook = player.dir > 0 ? viewW * 0.36 : viewW * 0.62;
+      const minCam = level.offset * TILE;
+      const maxCam = level.endless ? Infinity : level.pixelWidth - viewW;
+      camX = clamp(player.x + player.w / 2 - camLook, minCam, Math.max(minCam, maxCam));
+      prevCam = camX;
+    }
+  }
+
+  function scheduleResize() {
+    resize();
+    window.requestAnimationFrame(resize);
+    if (resizeTimer) window.clearTimeout(resizeTimer);
+    resizeTimer = window.setTimeout(() => {
+      resizeTimer = 0;
+      resize();
+    }, 160);
   }
 
   // ===================================================================
@@ -1695,7 +1814,7 @@
   let bannerT = 0;
 
   // presentation / "juice"
-  const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const reduceMotion = matchQuery('(prefers-reduced-motion: reduce)');
   let wipe = null;     // iris transition: { mode: 'open' | 'close', t, dur, done }
   let shake = 0;       // screen-shake amplitude (px)
   let hitStop = 0;     // tiny freeze on impactful hits
@@ -2574,14 +2693,15 @@
       showBanner('NEW RECORD', `${bestDistance} m beaten!`);
       sparkle(player.x + player.w / 2, player.y, 12, '#ffd23f');
     }
-    const z = level.themeAt(Math.floor((camX + viewW / 2) / TILE));
+    const centerCol = Math.floor((camX + viewW / 2) / TILE);
+    const z = level.themeAt(centerCol);
     if (z !== session.zone) {
       session.zone = z;
       bgPrev = bgTheme;
       bgTheme = z;
       bgFade = 0;
       if (player.state === 'play') Sound.startMusic(TRACK_FOR_THEME[z]);
-      showBanner('ZONE ' + (Math.floor(session.maxDist / 200) + 1), THEME_NAMES[z]);
+      showBanner('ZONE ' + (Math.floor(Math.max(0, centerCol) / 200) + 1), THEME_NAMES[z]);
     }
   }
 
@@ -2835,6 +2955,7 @@
 
   function resumeGame() {
     if (state !== 'paused') return;
+    Sound.unlock();
     setState('playing');
     Sound.pauseMusic(false);
     acc = 0;
@@ -2884,23 +3005,55 @@
   const overlays = { menu: $('menu'), paused: $('pause'), clear: $('clear'), gameover: $('over') };
   const hudEl = $('hud');
   const hudCache = new Map();
+  const activePointers = new Set();
+
+  function setJumpPressed(on) {
+    if (jumpBtnEl) jumpBtnEl.classList.toggle('pressed', on);
+  }
+
+  function updateTouchCue() {
+    if (!jumpLblEl || rootEl.dataset.input !== 'touch' || state !== 'playing' || !player) return;
+    let cue = 'JUMP';
+    if (player.state === 'play') {
+      if (player.vaultT > 0 && !player.onGround) cue = 'VAULT';
+      else if (player.wallT > 0 && !player.onGround) cue = 'KICK';
+      else if (!player.onGround && player.coyote <= 0 && !player.spinUsed && !(player.vy > 0 && nearGround(player))) cue = 'SPIN';
+    }
+    if (cue !== lastJumpCue) {
+      lastJumpCue = cue;
+      jumpLblEl.textContent = cue;
+    }
+  }
 
   function setState(s) {
     state = s;
+    const touchMode = rootEl.dataset.input === 'touch';
     for (const [key, el] of Object.entries(overlays)) {
       const on = key === s;
       el.classList.toggle('show', on);
       el.inert = !on; // hidden panels can't be focused, clicked or read by assistive tech
-      if (on) el.querySelector('.btn.primary')?.focus({ preventScroll: true });
+      el.setAttribute('aria-hidden', String(!on));
+      if (on && !touchMode) el.querySelector('.btn.primary')?.focus({ preventScroll: true });
     }
-    hudEl.classList.toggle('hidden', s === 'menu' || !session || session.demo);
+    const activeRun = s !== 'menu' && !!session && !session.demo;
+    const prevActive = appEl.dataset.active === 'true';
+    appEl.dataset.active = activeRun ? 'true' : 'false';
+    hudEl.classList.toggle('hidden', !activeRun);
+    if (touchUiEl) {
+      const showTouchPad = s === 'playing' && activeRun;
+      touchUiEl.classList.toggle('hidden', !showTouchPad);
+      touchUiEl.setAttribute('aria-hidden', String(!showTouchPad));
+    }
     if (s === 'playing' || s === 'wipe') {
       const a = document.activeElement;
       if (a instanceof HTMLElement && a !== document.body) a.blur();
     }
     keysDown.clear();
+    activePointers.clear();
+    setJumpPressed(false);
     input.pointer = false;
     input.queued = false;
+    if (prevActive !== activeRun) resize();
   }
 
   function setHud(id, text, pop = false) {
@@ -2909,7 +3062,7 @@
     hudCache.set(id, text);
     const el = $(id);
     el.textContent = text;
-    if (pop && had && !reduceMotion) {
+    if (pop && had && !reduceMotion && typeof el.animate === 'function') {
       el.animate(
         [{ transform: 'scale(1.35)', color: '#ffd23f' }, { transform: 'scale(1)', color: '#ffffff' }],
         { duration: 300, easing: 'cubic-bezier(.2,.9,.3,1.3)' }
@@ -2919,13 +3072,15 @@
 
   function updateHud() {
     if (!session || session.demo) return;
+    const compactStage = rootEl.dataset.device === 'phone' && rootEl.dataset.orientation === 'portrait';
     setHud('hud-score', pad(session.score, 6));
     setHud('hud-coins', `×${pad(session.coins % 100, 2)}`, true);
     setHud('hud-stage', session.mode === 'endless'
-      ? `∞ ${session.maxDist}m`
-      : `${session.stage + 1} · ${THEME_NAMES[session.stage].split(' ')[0]}`);
+      ? `∞${session.maxDist}m`
+      : (compactStage ? String(session.stage + 1) : `${session.stage + 1} · ${THEME_NAMES[session.stage].split(' ')[0]}`));
     setHud('hud-lives', session.mode === 'endless' ? '—' : `♥${session.lives}`, true);
     setHud('hud-best', pad(Math.max(highScore, session.score), 6));
+    updateTouchCue();
   }
 
   function showBanner(sub, title) {
@@ -2962,12 +3117,14 @@
   }
 
   function toggleMusic() {
+    Sound.unlock();
     Sound.setMusic(!Sound.musicOn);
     prefs.music = Sound.musicOn;
     savePrefs();
     refreshToggles();
   }
   function toggleSound() {
+    Sound.unlock();
     Sound.setSfx(!Sound.sfxOn);
     prefs.sound = Sound.sfxOn;
     savePrefs();
@@ -2975,6 +3132,7 @@
     Sound.play('select');
   }
   function toggleMute() {
+    Sound.unlock();
     Sound.setMuted(!Sound.muted);
     refreshToggles();
   }
@@ -2983,10 +3141,28 @@
     savePrefs();
     refreshToggles();
   }
+  const isFullscreenEnabled = () => Boolean(document.fullscreenEnabled || document.webkitFullscreenEnabled);
+  const getFullscreenElement = () => document.fullscreenElement || document.webkitFullscreenElement || null;
   function toggleFullscreen() {
-    if (!document.fullscreenEnabled) return;
-    if (document.fullscreenElement) document.exitFullscreen().catch(() => { /* ignore */ });
-    else document.documentElement.requestFullscreen({ navigationUI: 'hide' }).catch(() => { /* ignore */ });
+    if (!isFullscreenEnabled()) return;
+    if (getFullscreenElement()) {
+      const exit = document.exitFullscreen || document.webkitExitFullscreen;
+      if (typeof exit === 'function') {
+        try { Promise.resolve(exit.call(document)).catch(() => { /* ignore */ }); } catch { /* ignore */ }
+      }
+      return;
+    }
+    const el = document.documentElement;
+    if (typeof el.requestFullscreen === 'function') {
+      try {
+        Promise.resolve(el.requestFullscreen({ navigationUI: 'hide' }))
+          .catch(() => { try { Promise.resolve(el.requestFullscreen()).catch(() => { /* ignore */ }); } catch { /* ignore */ } });
+      } catch {
+        try { Promise.resolve(el.requestFullscreen()).catch(() => { /* ignore */ }); } catch { /* ignore */ }
+      }
+    } else if (typeof el.webkitRequestFullscreen === 'function') {
+      try { el.webkitRequestFullscreen(); } catch { /* ignore */ }
+    }
   }
 
   const modeButtons = [...document.querySelectorAll('.mode')];
@@ -3055,7 +3231,11 @@
   function bindUI() {
     modeButtons.forEach((b, i) => {
       b.addEventListener('click', () => { selectMode(i); Sound.unlock(); Sound.play('select'); });
-      b.addEventListener('dblclick', () => { selectMode(i); startSelected(); });
+      b.addEventListener('dblclick', () => {
+        if (rootEl.dataset.input === 'touch') return;
+        selectMode(i);
+        startSelected();
+      });
     });
     const onClick = (id, fn) => $(id).addEventListener('click', fn);
     onClick('btn-start', startSelected);
@@ -3074,12 +3254,21 @@
     onClick('btn-over-menu', goMenu);
     onClick('hud-pause', () => { if (state === 'playing') pauseGame(); else if (state === 'paused') resumeGame(); });
     onClick('hud-mute', toggleMute);
+    $('tally').addEventListener('click', () => { if (state === 'clear' && !tallyDone()) finishTally(); });
+    const hudActions = document.querySelector('.hud-actions');
+    if (hudActions) {
+      hudActions.addEventListener('pointerdown', e => e.stopPropagation());
+      hudActions.addEventListener('touchstart', e => e.stopPropagation(), { passive: true });
+    }
     const full = $('hud-full');
-    full.hidden = !document.fullscreenEnabled;
+    full.hidden = !isFullscreenEnabled();
     full.addEventListener('click', toggleFullscreen);
-    document.addEventListener('fullscreenchange', () => {
-      full.setAttribute('aria-pressed', String(!!document.fullscreenElement));
-    });
+    const onFsChange = () => {
+      full.setAttribute('aria-pressed', String(!!getFullscreenElement()));
+      scheduleResize();
+    };
+    document.addEventListener('fullscreenchange', onFsChange);
+    document.addEventListener('webkitfullscreenchange', onFsChange);
     // never leave focus on a clicked button (Space would re-trigger it mid-game)
     document.addEventListener('click', e => {
       if (e.target instanceof Element) e.target.closest('button')?.blur();
@@ -3148,10 +3337,23 @@
   }
 
   function bindInput() {
+    const syncInputMode = mode => {
+      if (inputOverride === mode) return;
+      inputOverride = mode;
+      const vp = getViewportSize();
+      const prevInput = rootEl.dataset.input;
+      applyDeviceProfile(vp.w, vp.h);
+      if (prevInput !== rootEl.dataset.input) resize();
+    };
+    const isInteractiveUI = target => target instanceof Element && !!target.closest('.hud-actions, .overlay, button:not(#btn-jump)');
+
     window.addEventListener('keydown', e => {
       Sound.unlock();
       if (e.ctrlKey || e.metaKey || e.altKey) return; // leave browser shortcuts alone
       const k = e.code;
+      if (JUMP_KEYS.has(k) || k === 'Enter' || k === 'Escape' || k === 'KeyP' || k === 'ArrowLeft' || k === 'ArrowRight' || k === 'KeyA' || k === 'KeyD') {
+        syncInputMode('desktop');
+      }
       const isJump = JUMP_KEYS.has(k);
       const onButton = e.target instanceof HTMLButtonElement;
       if (k === 'KeyM') { toggleMute(); return; }
@@ -3196,26 +3398,68 @@
       keysDown.delete(e.code);
       if (state === 'playing' && JUMP_KEYS.has(e.code)) e.preventDefault();
     });
-    canvas.addEventListener('pointerdown', e => {
-      e.preventDefault();
+
+    // Full-viewport touch/click play handler (supports portrait bottom area + #btn-jump + multi-touch)
+    appEl.addEventListener('pointerdown', e => {
+      if (e.pointerType === 'touch') syncInputMode('touch');
+      else if (e.pointerType === 'mouse') {
+        if (e.button !== 0) return;
+        syncInputMode('desktop');
+      }
       Sound.unlock();
-      if (state !== 'playing') return;
+      if (state !== 'playing' || isInteractiveUI(e.target)) return;
+      e.preventDefault();
+      activePointers.add(e.pointerId);
       input.queued = true;
       input.pointer = true;
-      try { canvas.setPointerCapture(e.pointerId); } catch { /* pointer already released */ }
+      setJumpPressed(true);
+      try { appEl.setPointerCapture(e.pointerId); } catch { /* pointer already released */ }
     });
-    const release = () => { input.pointer = false; };
-    window.addEventListener('pointerup', release);
-    window.addEventListener('pointercancel', release);
-    canvas.addEventListener('contextmenu', e => e.preventDefault());
-    document.addEventListener('pointerdown', () => Sound.unlock(), { capture: true });
-    window.addEventListener('blur', () => { keysDown.clear(); input.pointer = false; pauseGame(); });
+    const releasePointer = e => {
+      if (!activePointers.delete(e.pointerId)) return;
+      input.pointer = activePointers.size > 0;
+      setJumpPressed(input.pointer);
+    };
+    window.addEventListener('pointerup', releasePointer);
+    window.addEventListener('pointercancel', releasePointer);
+    appEl.addEventListener('lostpointercapture', releasePointer);
+
+    // Block iOS Safari long-press callout, selection loupe, double-tap zoom, and pull-to-refresh during gameplay
+    appEl.addEventListener('touchstart', e => {
+      syncInputMode('touch');
+      Sound.unlock();
+      if (state === 'playing' && !isInteractiveUI(e.target)) e.preventDefault();
+    }, { passive: false });
+    document.addEventListener('touchend', () => Sound.unlock(), { capture: true, passive: true });
+    document.addEventListener('pointerdown', e => {
+      if (e.pointerType === 'touch') syncInputMode('touch');
+      Sound.unlock();
+    }, { capture: true });
+    appEl.addEventListener('contextmenu', e => e.preventDefault());
+    const blockGesture = e => e.preventDefault();
+    document.addEventListener('gesturestart', blockGesture, { passive: false });
+    document.addEventListener('gesturechange', blockGesture, { passive: false });
+
+    const clearInputs = () => {
+      keysDown.clear();
+      activePointers.clear();
+      input.pointer = false;
+      setJumpPressed(false);
+    };
+    window.addEventListener('blur', () => { clearInputs(); pauseGame(); });
     document.addEventListener('visibilitychange', () => {
-      if (document.hidden) { pauseGame(); Sound.sleep(); }
-      else Sound.unlock();
+      if (document.hidden) { clearInputs(); pauseGame(); Sound.sleep(); }
+      else { scheduleResize(); Sound.unlock(); }
     });
-    window.addEventListener('pagehide', () => { pauseGame(); Sound.sleep(); });
-    window.addEventListener('resize', resize);
+    window.addEventListener('pagehide', () => { clearInputs(); pauseGame(); Sound.sleep(); });
+    window.addEventListener('pageshow', () => { scheduleResize(); Sound.unlock(); });
+    window.addEventListener('resize', scheduleResize);
+    window.addEventListener('orientationchange', scheduleResize);
+    if (window.visualViewport) window.visualViewport.addEventListener('resize', scheduleResize);
+    if (typeof window.matchMedia === 'function') {
+      const mq = window.matchMedia('(pointer: coarse)');
+      if (typeof mq.addEventListener === 'function') mq.addEventListener('change', scheduleResize);
+    }
   }
 
   // ===================================================================
